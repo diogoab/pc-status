@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+SoftHub Co — System & Process Executive Radar (pc-status / sys-status)
+Sessão interativa estilo htop com buffer de tela alternativo,
+atualização suave e restauração limpa do terminal ao sair com 'q'.
+"""
+
+import os
+import sys
+import time
+import shutil
+import socket
+import platform
+import argparse
+import subprocess
+import select
+import re
+
+# Tenta carregar módulos POSIX de terminal
+try:
+    import termios
+    import tty
+    HAS_TERMIOS = True
+except ImportError:
+    HAS_TERMIOS = False
+
+# ==============================================================================
+# Paleta de Cores ANSI
+# ==============================================================================
+CYAN    = "\033[0;36m"
+GREEN   = "\033[0;32m"
+YELLOW  = "\033[1;33m"
+RED     = "\033[0;31m"
+BLUE    = "\033[0;34m"
+MAGENTA = "\033[0;35m"
+BOLD    = "\033[1m"
+DIM     = "\033[2m"
+REVERSE = "\033[7m"
+NC      = "\033[0m"
+
+# ==============================================================================
+# Mapeamento de Portas SoftHub & Dev Stack
+# ==============================================================================
+KNOWN_PORTS = {
+    22:    ("SSH Server", "Acesso Remoto"),
+    2785:  ("OpenWA / WhatsApp", "Disparos Talent"),
+    3000:  ("Web App Dev", "Aplicação Web"),
+    3055:  ("Landing Principal", "Next.js Frontend"),
+    3056:  ("Landing FluxZap", "Next.js Frontend"),
+    3057:  ("Landing Escola", "Next.js Frontend"),
+    3306:  ("MySQL / MariaDB", "Banco Relacional"),
+    4000:  ("Dev Backend API", "API Local"),
+    5000:  ("Python Microservice", "Flask/API"),
+    5050:  ("Python Microservice", "Flask/API"),
+    5080:  ("Python Microservice", "Flask/API"),
+    5090:  ("Python Microservice", "Flask/API"),
+    5432:  ("PostgreSQL Prim.", "Banco Relacional"),
+    5433:  ("PostgreSQL Sec.", "Banco Relacional"),
+    5678:  ("n8n Workflows", "Automação"),
+    6379:  ("Redis Server", "Cache & Filas"),
+    8000:  ("FastAPI Service", "API Python"),
+    8050:  ("Uvicorn AI Agent", "Microserviço AI"),
+    8099:  ("Cloudflared Tunnel", "Túnel SoftHub"),
+    11434: ("Ollama AI Engine", "Modelos de IA")
+}
+
+def strip_ansi(s):
+    """Remove sequências ANSI para medição correta de largura."""
+    return re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", s)
+
+def pad_ansi(s, width):
+    """Aplica espaçamento à direita respeitando caracteres visíveis."""
+    vis = len(strip_ansi(s))
+    pad = max(0, width - vis)
+    return s + (" " * pad)
+
+def render_bar(pct, width=26):
+    """Renderiza barra de progresso gráfica com cores semafóricas."""
+    pct = max(0.0, min(100.0, pct))
+    filled = int(round(pct / 100.0 * width))
+    filled = max(0, min(width, filled))
+    empty = width - filled
+    
+    if pct < 65.0:
+        c = GREEN
+    elif pct < 85.0:
+        c = YELLOW
+    else:
+        c = RED
+    return f"{c}[{'|' * filled}{'.' * empty}]{NC}"
+
+def get_cpu_info():
+    """Retorna modelo do processador e contagem de núcleos."""
+    model = "Processador Genérico"
+    cores = 0
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("model name") and model == "Processador Genérico":
+                    model = line.split(":", 1)[1].strip()
+                if line.startswith("processor"):
+                    cores += 1
+    except Exception:
+        cores = os.cpu_count() or 1
+    return model, cores
+
+def sample_cpu_pct(sample_sec=0.06):
+    """Calcula taxa de uso de CPU via amostragem delta de /proc/stat."""
+    try:
+        def read_stat():
+            with open("/proc/stat") as f:
+                fields = [float(x) for x in f.readline().split()[1:8]]
+            idle = fields[3] + fields[4]
+            total = sum(fields)
+            return idle, total
+
+        i1, t1 = read_stat()
+        time.sleep(sample_sec)
+        i2, t2 = read_stat()
+        diff_total = t2 - t1
+        diff_idle = i2 - i1
+        if diff_total <= 0:
+            return 0.0
+        return max(0.0, min(100.0, 100.0 * (1.0 - diff_idle / diff_total)))
+    except Exception:
+        return 0.0
+
+def get_memory_info():
+    """Lê memória RAM e Swap de /proc/meminfo."""
+    mem = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    mem[parts[0].strip()] = int(parts[1].strip().split()[0])
+    except Exception:
+        pass
+
+    total = mem.get("MemTotal", 1)
+    avail = mem.get("MemAvailable", 0)
+    used = total - avail
+    swap_total = mem.get("SwapTotal", 0)
+    swap_free = mem.get("SwapFree", 0)
+    swap_used = swap_total - swap_free
+
+    ram_pct = (used / total) * 100.0 if total > 0 else 0.0
+    swap_pct = (swap_used / swap_total) * 100.0 if swap_total > 0 else 0.0
+
+    return {
+        "ram_pct": ram_pct,
+        "ram_used_gb": used / (1024 * 1024),
+        "ram_tot_gb": total / (1024 * 1024),
+        "swap_pct": swap_pct,
+        "swap_used_gb": swap_used / (1024 * 1024),
+        "swap_tot_gb": swap_total / (1024 * 1024)
+    }
+
+def get_disk_info(path="/"):
+    """Retorna uso da partição raiz."""
+    try:
+        usage = shutil.disk_usage(path)
+        pct = (usage.used / usage.total) * 100.0 if usage.total > 0 else 0.0
+        return {
+            "pct": pct,
+            "used_gb": usage.used / (1024 ** 3),
+            "tot_gb": usage.total / (1024 ** 3)
+        }
+    except Exception:
+        return {"pct": 0.0, "used_gb": 0.0, "tot_gb": 0.0}
+
+def get_os_info():
+    """Identifica distribuição Linux."""
+    os_name = "Linux"
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("PRETTY_NAME="):
+                    os_name = line.split("=", 1)[1].strip("\"\n")
+                    break
+    except Exception:
+        pass
+    return os_name
+
+def get_uptime_str():
+    """Formata tempo de atividade da máquina."""
+    try:
+        with open("/proc/uptime") as f:
+            uptime_sec = float(f.read().split()[0])
+        days, rem = divmod(int(uptime_sec), 86400)
+        hours, rem = divmod(rem, 3600)
+        mins, _ = divmod(rem, 60)
+        if days > 0:
+            return f"{days}d {hours}h {mins}m"
+        elif hours > 0:
+            return f"{hours}h {mins}m"
+        else:
+            return f"{mins}m"
+    except Exception:
+        return "N/A"
+
+def get_active_ports():
+    """Identifica portas TCP em LISTEN via ss."""
+    ports = set()
+    try:
+        out = subprocess.check_output(["ss", "-tln"], stderr=subprocess.DEVNULL, text=True)
+        for line in out.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 4:
+                local_addr = parts[3]
+                m = re.search(r":(\d+)$", local_addr)
+                if m:
+                    ports.add(int(m.group(1)))
+    except Exception:
+        pass
+    return ports
+
+def check_core_services(active_ports):
+    """Verifica estado dos serviços principais."""
+    services = []
+
+    # 1. Docker
+    try:
+        out = subprocess.check_output(["docker", "ps", "-q"], stderr=subprocess.DEVNULL, text=True)
+        c_count = len(out.strip().splitlines()) if out.strip() else 0
+        services.append(("Docker", True, f"{c_count} ativos"))
+    except Exception:
+        services.append(("Docker", False, "inativo"))
+
+    # 2. PM2
+    try:
+        out = subprocess.check_output(["pm2", "jlist"], stderr=subprocess.DEVNULL, text=True)
+        import json
+        apps = json.loads(out)
+        online = sum(1 for a in apps if a.get("pm2_env", {}).get("status") == "online")
+        services.append(("PM2", True, f"{online}/{len(apps)} apps"))
+    except Exception:
+        services.append(("PM2", False, "inativo"))
+
+    # 3. PostgreSQL
+    pg_active = (5432 in active_ports) or (5433 in active_ports)
+    services.append(("PostgreSQL", pg_active, ":5432" if pg_active else "offline"))
+
+    # 4. MySQL
+    my_active = 3306 in active_ports
+    services.append(("MySQL", my_active, ":3306" if my_active else "offline"))
+
+    # 5. Ollama AI
+    ol_active = 11434 in active_ports
+    services.append(("Ollama AI", ol_active, ":11434" if ol_active else "offline"))
+
+    # 6. Cloudflared Tunnel
+    cf_active = (8099 in active_ports)
+    services.append(("Cloudflared", cf_active, ":8099" if cf_active else "offline"))
+
+    # 7. n8n
+    n8n_active = 5678 in active_ports
+    services.append(("n8n Workflow", n8n_active, ":5678" if n8n_active else "offline"))
+
+    # 8. SSH Server
+    ssh_active = 22 in active_ports
+    services.append(("SSH Server", ssh_active, ":22" if ssh_active else "offline"))
+
+    return services
+
+def get_top_processes(sort_key="-%cpu", limit=5):
+    """Retorna os top N processos ordenados por CPU ou Memória."""
+    cmd = ["ps", "-eo", "pid,user:10,%cpu,%mem,rss,comm,args", f"--sort={sort_key}", "--no-headers"]
+    procs = []
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True).splitlines()
+        for line in out:
+            parts = line.strip().split(None, 6)
+            if len(parts) >= 6:
+                pid, user, cpu, mem, rss_kb, comm = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
+                args = parts[6] if len(parts) > 6 else comm
+                
+                try:
+                    rss_val = int(rss_kb)
+                    if rss_val >= 1024 * 1024:
+                        rss_str = f"{rss_val / (1024 * 1024):.1f} GB"
+                    else:
+                        rss_str = f"{rss_val / 1024:.0f} MB"
+                except Exception:
+                    rss_str = f"{rss_kb} KB"
+
+                words = args.split()
+                if comm in ("node", "python", "python3", "python3.10", "uvicorn", "next-server") and len(words) > 1:
+                    clean_args = []
+                    for w in words[1:3]:
+                        if not w.startswith("-"):
+                            clean_args.append(os.path.basename(w))
+                    clean_cmd = f"{comm} {' '.join(clean_args)}".strip()
+                else:
+                    clean_cmd = comm
+
+                if len(clean_cmd) > 28:
+                    clean_cmd = clean_cmd[:25] + "..."
+
+                procs.append({
+                    "pid": pid,
+                    "user": user,
+                    "cpu": float(cpu),
+                    "mem": float(mem),
+                    "rss": rss_str,
+                    "cmd": clean_cmd
+                })
+            if len(procs) >= limit:
+                break
+    except Exception:
+        pass
+    return procs
+
+def display_screen(limit=5, show_all_ports=False, interval=2.0, interactive=False):
+    """Compila o radar visual do pc-status."""
+    hostname = socket.gethostname()
+    os_name = get_os_info()
+    kernel = platform.release()
+    uptime = get_uptime_str()
+    load = os.getloadavg()
+    cpu_model, cores = get_cpu_info()
+    
+    cpu_pct = sample_cpu_pct(0.06)
+    mem_info = get_memory_info()
+    disk_info = get_disk_info("/")
+    active_ports = get_active_ports()
+    services = check_core_services(active_ports)
+
+    top_cpu = get_top_processes("-%cpu", limit)
+    top_mem = get_top_processes("-%mem", limit)
+
+    out = []
+    SEP = f"{CYAN}================================================================={NC}"
+    SUBSEP = f"{CYAN}-----------------------------------------------------------------{NC}"
+
+    out.append(SEP)
+    out.append(f"{CYAN}{BOLD}             SoftHub Co — System & Process Radar (pc-status)     {NC}")
+    out.append(SEP)
+    out.append(f" {BOLD}Host:{NC} {hostname:<12} | {BOLD}OS:{NC} {os_name} ({kernel})")
+    out.append(f" {BOLD}CPU:{NC}  {cpu_model} ({cores} cores)")
+    out.append(f" {BOLD}Uptime:{NC} {uptime:<10} | {BOLD}Load Avg:{NC} {load[0]:.2f}, {load[1]:.2f}, {load[2]:.2f}")
+    out.append(SUBSEP)
+
+    # 1. Recursos & Hardware
+    out.append(f"{YELLOW}{BOLD}[RECURSOS & HARDWARE]{NC}")
+    out.append(f"  CPU   {render_bar(cpu_pct)}  {BOLD}{cpu_pct:>5.1f}%{NC}")
+    out.append(f"  RAM   {render_bar(mem_info['ram_pct'])}  {BOLD}{mem_info['ram_pct']:>5.1f}%{NC} ({mem_info['ram_used_gb']:.1f} GB / {mem_info['ram_tot_gb']:.1f} GB)")
+    out.append(f"  SWAP  {render_bar(mem_info['swap_pct'])}  {BOLD}{mem_info['swap_pct']:>5.1f}%{NC} ({mem_info['swap_used_gb']:.1f} GB / {mem_info['swap_tot_gb']:.1f} GB)")
+    out.append(f"  DISK/ {render_bar(disk_info['pct'])}  {BOLD}{disk_info['pct']:>5.1f}%{NC} ({disk_info['used_gb']:.1f} GB / {disk_info['tot_gb']:.1f} GB)")
+    out.append(SUBSEP)
+
+    # 2. Radar de Serviços & Infraestrutura
+    out.append(f"{YELLOW}{BOLD}[RADAR DE SERVIÇOS & INFRAESTRUTURA]{NC}")
+    for i in range(0, len(services), 2):
+        s1 = services[i]
+        c1 = GREEN if s1[1] else RED
+        st1 = "ONLINE" if s1[1] else "OFFLINE"
+        col1 = f"  {c1}●{NC} {s1[0]:<14} {c1}{st1:<7}{NC} {s1[2]}"
+
+        if i + 1 < len(services):
+            s2 = services[i+1]
+            c2 = GREEN if s2[1] else RED
+            st2 = "ONLINE" if s2[1] else "OFFLINE"
+            col2 = f"{c2}●{NC} {s2[0]:<14} {c2}{st2:<7}{NC} {s2[2]}"
+            out.append(f"{pad_ansi(col1, 38)} {col2}")
+        else:
+            out.append(col1)
+    out.append(SUBSEP)
+
+    # 3. Top Processos por CPU
+    out.append(f"{YELLOW}{BOLD}[TOP {limit} PROCESSOS POR CONSUMO DE CPU]{NC}")
+    out.append(f"  {BOLD}{'PID':>7}  {'USER':<10}  {'%CPU':>6}  {'%MEM':>6}  {'RSS':>8}   {'PROCESSO'}{NC}")
+    for p in top_cpu:
+        cpu_color = RED if p["cpu"] > 50 else (YELLOW if p["cpu"] > 20 else GREEN)
+        out.append(f"  {p['pid']:>7}  {p['user']:<10}  {cpu_color}{p['cpu']:>5.1f}%{NC}  {p['mem']:>5.1f}%  {p['rss']:>8}   {p['cmd']}")
+    out.append("")
+
+    # 4. Top Processos por Memória (RAM)
+    out.append(f"{YELLOW}{BOLD}[TOP {limit} PROCESSOS POR CONSUMO DE MEMÓRIA (RAM)]{NC}")
+    out.append(f"  {BOLD}{'PID':>7}  {'USER':<10}  {'%CPU':>6}  {'%MEM':>6}  {'RSS':>8}   {'PROCESSO'}{NC}")
+    for p in top_mem:
+        mem_color = RED if p["mem"] > 15 else (YELLOW if p["mem"] > 8 else GREEN)
+        out.append(f"  {p['pid']:>7}  {p['user']:<10}  {p['cpu']:>5.1f}%  {mem_color}{p['mem']:>5.1f}%{NC}  {p['rss']:>8}   {p['cmd']}")
+    out.append(SUBSEP)
+
+    # 5. Radar de Portas SoftHub em 2 Colunas com gutter perfeito
+    out.append(f"{YELLOW}{BOLD}[PORTAS LOCAIS ATIVAS — RADAR SOFTHUB]{NC}")
+    active_known = [(p, desc) for p, desc in sorted(KNOWN_PORTS.items()) if p in active_ports]
+    if active_known:
+        for i in range(0, len(active_known), 2):
+            p1, (name1, cat1) = active_known[i]
+            col1 = f"  • {CYAN}{p1:<5}{NC} {GREEN}●{NC} {BOLD}{name1:<19}{NC} {DIM}{cat1:<13}{NC}"
+            if i + 1 < len(active_known):
+                p2, (name2, cat2) = active_known[i+1]
+                col2 = f"• {CYAN}{p2:<5}{NC} {GREEN}●{NC} {BOLD}{name2:<19}{NC} {DIM}{cat2}{NC}"
+                out.append(f"{pad_ansi(col1, 49)} {col2}")
+            else:
+                out.append(col1)
+    else:
+        out.append(f"  {DIM}Nenhuma porta SoftHub ativa no momento.{NC}")
+
+    if show_all_ports:
+        other_ports = sorted([p for p in active_ports if p not in KNOWN_PORTS])
+        if other_ports:
+            out.append(f"\n  {DIM}Outras portas ativas:{NC} " + ", ".join(f":{p}" for p in other_ports[:15]))
+
+    out.append(SEP)
+
+    if interactive:
+        out.append(f"{REVERSE} [q] Sair | [r] Atualizar | [+/-] Taxa ({interval:.1f}s) | [n] Procs ({limit}) | [a] Portas {NC}")
+
+    return "\n".join(out)
+
+def kill_port(port):
+    """Encerra processo escutando na porta especificada."""
+    print(f"{YELLOW}Procurando processos escutando na porta {port}...{NC}")
+    try:
+        cmd = f"fuser -k {port}/tcp 2>/dev/null || true"
+        subprocess.run(cmd, shell=True, check=True)
+        print(f"{GREEN}Comando executado para a porta {port}. Verificando status...{NC}")
+        time.sleep(0.5)
+        active = get_active_ports()
+        if port in active:
+            print(f"{RED}Aviso: A porta {port} ainda parece estar ativa (pode requerer sudo).{NC}")
+        else:
+            print(f"{GREEN}Porta {port} liberada com sucesso!{NC}")
+    except Exception as e:
+        print(f"{RED}Erro ao tentar liberar a porta: {e}{NC}")
+
+def launch_new_window():
+    """Abre uma nova janela de terminal dedicada rodando pc-status."""
+    terminals = [
+        ["gnome-terminal", "--title=SoftHub PC Status", "--", "pc-status"],
+        ["xterm", "-title", "SoftHub PC Status", "-e", "pc-status"],
+        ["alacritty", "-t", "SoftHub PC Status", "-e", "pc-status"],
+        ["kitty", "-T", "SoftHub PC Status", "pc-status"]
+    ]
+    for term_cmd in terminals:
+        binary = term_cmd[0]
+        if shutil.which(binary):
+            print(f"{GREEN}Abrindo nova janela de terminal via {binary}...{NC}")
+            subprocess.Popen(term_cmd, start_new_session=True)
+            return True
+    print(f"{RED}Nenhum emulador de terminal compatível encontrado.{NC}")
+    return False
+
+def run_interactive_session(limit=5, show_all_ports=False, interval=2.0):
+    """Sessão interativa full-screen estilo htop no buffer alternativo."""
+    if not sys.stdout.isatty() or not sys.stdin.isatty() or not HAS_TERMIOS:
+        # Fallback instantâneo para ambiente sem terminal interativo (pipe, script, etc.)
+        print(display_screen(limit=limit, show_all_ports=show_all_ports, interval=interval, interactive=False))
+        return
+
+    old_settings = termios.tcgetattr(sys.stdin)
+    cur_limit = limit
+    cur_interval = interval
+    cur_show_all = show_all_ports
+
+    try:
+        tty.setcbreak(sys.stdin.fileno())
+        # Alterna para o alternate screen buffer (como htop/vim) e esconde o cursor
+        sys.stdout.write("\033[?1049h\033[?25l\033[H\033[2J")
+        sys.stdout.flush()
+
+        while True:
+            # Renderiza o frame completo
+            screen = display_screen(
+                limit=cur_limit,
+                show_all_ports=cur_show_all,
+                interval=cur_interval,
+                interactive=True
+            )
+            # Atualização suave sem flickering (cursor home + clear-to-eol)
+            formatted = "\033[H" + "\n".join(line + "\033[K" for line in screen.splitlines()) + "\033[J"
+            sys.stdout.write(formatted)
+            sys.stdout.flush()
+
+            # Aguarda tecla ou timeout do intervalo
+            start_wait = time.time()
+            while time.time() - start_wait < cur_interval:
+                time_left = max(0.01, cur_interval - (time.time() - start_wait))
+                r, _, _ = select.select([sys.stdin], [], [], min(0.15, time_left))
+                if r:
+                    key = sys.stdin.read(1)
+                    if key in ("q", "Q", "\x1b", "\x03"):  # q, ESC, Ctrl+C
+                        return
+                    elif key in ("r", "R"):  # Força atualização imediata
+                        break
+                    elif key in ("+", "="):  # Aumenta velocidade
+                        cur_interval = max(0.5, cur_interval - 0.5)
+                        break
+                    elif key in ("-", "_"):  # Diminui velocidade
+                        cur_interval = min(10.0, cur_interval + 0.5)
+                        break
+                    elif key in ("a", "A"):  # Alterna portas
+                        cur_show_all = not cur_show_all
+                        break
+                    elif key in ("n", "N"):  # Alterna limite de processos
+                        cur_limit = 10 if cur_limit == 5 else (5 if cur_limit == 3 else 3)
+                        break
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Restaura o buffer primário do terminal e o cursor (terminal 100% limpo como antes)
+        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.flush()
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="pc-status",
+        description="SoftHub Co — Monitor Executivo de Recursos e Processos do PC (estilo htop).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Atalhos na Sessão Interativa (como no htop):
+  [q] ou [ESC]   Sair e restaurar seu terminal perfeitamente
+  [r]            Atualizar métricas imediatamente
+  [+] / [-]      Acelerar ou desacelerar intervalo de atualização
+  [n]            Alternar quantidade de processos exibidos (3 -> 5 -> 10)
+  [a]            Alternar exibição de todas as portas do sistema
+
+Exemplos:
+  pc-status                   # Abre a sessão interativa direta (estilo htop)
+  pc-status -s                # Foto instantânea única (estática, sem sessão)
+  pc-status -W                # Abre em uma nova janela de terminal dedicada
+  pc-status -n 10             # Abre exibindo Top 10 processos
+  pc-status --kill-port 3055  # Desaloca processo preso na porta 3055
+        """
+    )
+    parser.add_argument("-s", "--snapshot", "--once", action="store_true", help="Executa apenas uma foto instantânea (modo não-interativo)")
+    parser.add_argument("-w", "--watch", action="store_true", help="Compatibilidade: inicia a sessão contínua interativa")
+    parser.add_argument("-W", "--new-window", "--window", action="store_true", help="Abre uma nova janela de terminal independente rodando o pc-status")
+    parser.add_argument("-i", "--interval", type=float, default=2.0, help="Intervalo de atualização em segundos (padrão: 2.0s)")
+    parser.add_argument("-n", "--num", type=int, default=5, help="Quantidade de processos no Top CPU e Memória (padrão: 5)")
+    parser.add_argument("-a", "--all-ports", action="store_true", help="Exibe portas adicionais do sistema além do radar SoftHub")
+    parser.add_argument("--kill-port", type=int, help="Encerra o processo que estiver escutando na porta especificada")
+
+    args = parser.parse_args()
+
+    if args.kill_port:
+        kill_port(args.kill_port)
+        return
+
+    if args.new_window:
+        launch_new_window()
+        return
+
+    # Se chamado com --snapshot / --once ou se o output for pipe/redirecionamento, imprime estático
+    if args.snapshot or not sys.stdout.isatty() or not sys.stdin.isatty():
+        print(display_screen(limit=args.num, show_all_ports=args.all_ports, interval=args.interval, interactive=False))
+        return
+
+    # Comportamento padrão igual ao htop: abre a sessão interativa no alternate screen buffer
+    run_interactive_session(limit=args.num, show_all_ports=args.all_ports, interval=args.interval)
+
+if __name__ == "__main__":
+    main()

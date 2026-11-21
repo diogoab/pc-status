@@ -1,0 +1,16 @@
+Source: pc-status
+Section: utils
+Priority: optional
+Maintainer: Diogo Barbosa <diogo.alves.barbosa@gmail.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.0
+Homepage: https://softhubco.com.br
+
+Package: pc-status
+Architecture: all
+Depends: python3, iproute2, procps, psmisc, ${misc:Depends}
+Description: Monitor Executivo de Recursos e Processos
+ pc-status e um monitor de terminal executivo em tempo real
+ que exibe metricas de hardware, consumo de CPU e RAM por processo,
+ status de containers Docker e apps PM2, alem de mapeamento
+ de portas de rede em 2 colunas.

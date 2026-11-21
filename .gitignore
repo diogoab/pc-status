@@ -1,0 +1,10 @@
+*.deb
+*.dsc
+*.buildinfo
+*.changes
+*.tar.xz
+*.upload
+debian/.debhelper/
+debian/pc-status/
+debian/pc-status.*
+debian/files

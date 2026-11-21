@@ -1,0 +1,8 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+override_dh_auto_install:
+	install -D -m 0755 pc-status debian/pc-status/usr/bin/pc-status
+	mkdir -p debian/pc-status/usr/bin
+	ln -sf pc-status debian/pc-status/usr/bin/sys-status
